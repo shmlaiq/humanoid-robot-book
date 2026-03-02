@@ -6,9 +6,9 @@ const config: Config = {
   title: 'Pros and Cons of AI Humanoid Robots in Human Life',
   tagline: 'From Digital Intelligence to Embodied Autonomy',
   favicon: 'img/favicon.ico',
-  url: 'https://humanoid-robots-book.vercel.app',
+  url: 'https://humanoid-robot-book-gamma.vercel.app',
   baseUrl: '/',
-  organizationName: 'faisallaiq',
+  organizationName: 'shmlaiq',
   projectName: 'humanoid-robot-book',
   onBrokenLinks: 'warn',
   markdown: {
@@ -48,7 +48,7 @@ const config: Config = {
           label: 'Read the Book',
         },
         {
-          href: 'https://github.com/faisallaiq/humanoid-robot-book',
+          href: 'https://github.com/shmlaiq/humanoid-robot-book',
           label: 'GitHub',
           position: 'right',
         },
