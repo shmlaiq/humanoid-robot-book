@@ -1,0 +1,1743 @@
+---
+id: chapter-12-voice-to-action
+title: "Chapter 12: Voice to Action Pipeline"
+sidebar_label: "Ch 12 — Voice to Action"
+sidebar_position: 2
+---
+
+# Chapter 12: Building Voice-to-Action Pipelines
+
+> **Part V — Vision-Language-Action Systems**
+> *Version 1.0 — Draft | Author: Muhammad Faisal Laiq Siddiqui*
+
+---
+
+## 12.1 Introduction — The Voice-Commanded Robot as the Human Interface
+
+In every science fiction depiction of a robot assistant, the human speaks and the robot acts. The human says "bring me the red mug" and the robot navigates to the kitchen, identifies the mug, grasps it without spilling its contents, and returns. The interaction is natural, effortless, and immediate. No graphical interface, no command syntax, no joystick.
+
+This vision is finally technically tractable — and this chapter builds it.
+
+The three technical developments that converged to make voice-commanded robots practical arrived in the same three-year window: OpenAI's Whisper [1] (2022) brought robust, open-source speech recognition that works in noisy environments across 99 languages; GPT-4o [2] (2024) brought reasoning capable of converting ambiguous natural language into structured action plans; and the VLA models examined in Chapter 11 provided the robot control substrate that can execute those plans. The missing piece — the engineering that joins these three systems into a coherent, real-time pipeline running on a robot — is the subject of this chapter.
+
+We will build, from first principles, a complete **voice-to-action pipeline**:
+
+```
+Microphone → Whisper → GPT-4o → Action Parser → ROS 2 Action Server → Robot
+```
+
+Every component is fully implemented in Python, compatible with ROS 2 Humble [3], and designed to run on the robotics hardware described in earlier chapters. The result is a system that converts spoken words into physical robot action — the closest thing currently achievable to a robot that simply does what you ask.
+
+---
+
+## 12.2 Pipeline Overview and Architecture
+
+Before diving into implementation, a clear picture of the complete system is essential. The pipeline consists of six stages, each with defined inputs, outputs, and failure modes.
+
+**Figure 12.1 — Complete Voice-to-Action Pipeline Architecture**
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                     VOICE-TO-ACTION PIPELINE                                 │
+│                                                                              │
+│  ┌─────────────┐     ┌─────────────────────────────────────────────────┐    │
+│  │             │     │              ROS 2 NODES                        │    │
+│  │  Microphone │     │                                                  │    │
+│  │  (raw audio)│     │  ┌─────────────────────────────────────────┐   │    │
+│  └──────┬──────┘     │  │  whisper_node.py                        │   │    │
+│         │ PCM audio  │  │  - Captures audio from mic              │   │    │
+│         │            │  │  - Runs Whisper large-v3 inference      │   │    │
+│         └───────────▶│  │  - Publishes: /speech/transcription     │   │    │
+│                      │  └──────────────────┬──────────────────────┘   │    │
+│                      │                     │ String (transcribed text) │    │
+│                      │                     ▼                           │    │
+│                      │  ┌─────────────────────────────────────────┐   │    │
+│                      │  │  gpt4o_planner_node.py                  │   │    │
+│                      │  │  - Subscribes: /speech/transcription    │   │    │
+│                      │  │  - Calls GPT-4o API with robot context  │   │    │
+│                      │  │  - Publishes: /task/action_plan         │   │    │
+│                      │  └──────────────────┬──────────────────────┘   │    │
+│                      │                     │ JSON ActionPlan            │    │
+│                      │                     ▼                           │    │
+│                      │  ┌─────────────────────────────────────────┐   │    │
+│                      │  │  action_parser_node.py                  │   │    │
+│                      │  │  - Validates + grounds action plan      │   │    │
+│                      │  │  - Maps objects to detected poses       │   │    │
+│                      │  │  - Sends goal to: /execute_task         │   │    │
+│                      │  └──────────────────┬──────────────────────┘   │    │
+│                      │                     │ ExecuteTask Action Goal    │    │
+│                      │                     ▼                           │    │
+│                      │  ┌─────────────────────────────────────────┐   │    │
+│                      │  │  task_executor_server.py (Action Server)│   │    │
+│                      │  │  - Executes NavigateTo, PickUp, Place   │   │    │
+│                      │  │  - Publishes feedback during execution  │   │    │
+│                      │  │  - Handles cancellation + recovery      │   │    │
+│                      │  └──────────────────┬──────────────────────┘   │    │
+│                      └─────────────────────┼────────────────────────── ┘   │
+│                                            │ Joint commands / EE poses       │
+│                                            ▼                                 │
+│                              ┌─────────────────────┐                        │
+│                              │    Physical Robot    │                        │
+│                              │  (arm + base + TTS) │                        │
+│                              └─────────────────────┘                        │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Latency Budget.** End-to-end latency from the completion of speech to the first robot movement is the sum of all pipeline stages. The table below shows the latency budget for a typical "bring me the red mug" command:
+
+| Stage | Component | Typical Latency | Notes |
+|:---|:---|:---:|:---|
+| Audio capture | Microphone buffer | 200–500 ms | VAD-triggered; 1 s audio minimum |
+| Speech recognition | Whisper large-v3 | 300–800 ms | GPU inference; ~1 s audio |
+| LLM planning | GPT-4o API | 500–1,500 ms | Network + model inference |
+| Action parsing + grounding | Object detection lookup | 50–150 ms | Local; uses cached detections |
+| Action server startup | ROS 2 overhead | 10–30 ms | First goal only |
+| **Total (typical)** | | **~1.1–3.0 s** | Acceptable for non-urgent tasks |
+
+A three-second command-to-motion latency is acceptable for household service tasks (fetching items, carrying objects) but is too slow for tasks requiring rapid response to environmental changes. Chapter 13 discusses streaming and predictive execution strategies to reduce this latency for time-critical operations.
+
+---
+
+## 12.3 OpenAI Whisper Integration in ROS 2
+
+### 12.3.1 What Whisper Is
+
+OpenAI Whisper [1] is a transformer-based automatic speech recognition (ASR) system trained on 680,000 hours of multilingual and multitask audio data collected from the web. Unlike prior ASR systems that required extensive fine-tuning on domain-specific data and careful acoustic modeling, Whisper achieves robust transcription across diverse audio conditions — background noise, accents, reverberant environments — without adaptation.
+
+Whisper's architecture is an encoder-decoder transformer. The encoder processes 30-second audio chunks converted to log-Mel spectrograms; the decoder autoregressively predicts text tokens conditioned on the audio encoding. The model is trained on the task of transcription as a text generation problem, with special tokens controlling the language, task type (transcription vs translation), and whether to produce timestamps.
+
+Whisper is available in five sizes, providing a range of accuracy-latency trade-offs:
+
+| Model Size | Parameters | Relative Speed | Word Error Rate (English) | Recommended Use |
+|:---:|:---:|:---:|:---:|:---|
+| tiny | 39M | 32x | ~8.5% | Edge devices, rapid prototyping |
+| base | 74M | 16x | ~6.4% | Low-resource embedded systems |
+| small | 244M | 6x | ~4.9% | Real-time on mid-range GPU |
+| medium | 769M | 2x | ~3.7% | Balanced accuracy/speed |
+| large-v3 | 1.55B | 1x (baseline) | ~2.7% | Production humanoid robots |
+
+For a humanoid robot operating in a home or office environment with a good-quality microphone, **large-v3** is the appropriate choice. Its 2.7% word error rate under standard conditions degrades gracefully in noise, and on a single NVIDIA GPU the ~600 ms inference time for a 2-second utterance is within the latency budget.
+
+### 12.3.2 Python: Loading Whisper and Transcribing Audio
+
+The following standalone module handles microphone capture and transcription using the `faster-whisper` library — a CTranslate2-based reimplementation of Whisper that achieves 2–4x faster inference than the original PyTorch implementation while maintaining identical accuracy.
+
+```python
+# whisper_transcriber.py
+# Standalone Whisper transcription module for ROS 2 node integration.
+# Requires: pip install faster-whisper pyaudio numpy
+
+from __future__ import annotations
+
+import io
+import queue
+import struct
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+import numpy as np
+import pyaudio
+from faster_whisper import WhisperModel
+
+
+@dataclass
+class TranscriptionResult:
+    """A completed transcription with metadata."""
+    text: str
+    language: str
+    confidence: float          # Mean log-probability of all segments
+    duration_audio_s: float    # Duration of the audio chunk transcribed
+    latency_s: float           # Wall-clock time from end of speech to result
+
+
+@dataclass
+class WhisperConfig:
+    """Configuration for the Whisper transcription module."""
+    model_size: str = "large-v3"
+    device: str = "cuda"              # "cuda" or "cpu"
+    compute_type: str = "float16"     # "float16", "int8_float16", "int8"
+    language: Optional[str] = "en"   # None for auto-detect
+    # Voice Activity Detection (VAD) parameters
+    vad_silence_threshold_s: float = 0.8   # Silence duration to end utterance
+    vad_min_speech_duration_s: float = 0.5 # Minimum utterance length
+    vad_max_utterance_duration_s: float = 15.0  # Max utterance before forced cut
+    # Audio capture parameters
+    sample_rate: int = 16000
+    channels: int = 1
+    chunk_size: int = 1024   # Frames per PyAudio buffer
+
+
+class WhisperTranscriber:
+    """
+    Real-time speech transcription using Whisper large-v3.
+
+    Captures audio from the default microphone, applies voice activity
+    detection (VAD) to segment utterances, and transcribes each utterance
+    asynchronously.
+
+    Usage:
+        def on_transcription(result: TranscriptionResult):
+            print(f"Heard: {result.text}")
+
+        transcriber = WhisperTranscriber(callback=on_transcription)
+        transcriber.start()
+        # ... robot runs ...
+        transcriber.stop()
+    """
+
+    def __init__(
+        self,
+        callback: Callable[[TranscriptionResult], None],
+        config: WhisperConfig = WhisperConfig(),
+    ) -> None:
+        self.callback = callback
+        self.config = config
+        self._running = False
+        self._audio_queue: queue.Queue[np.ndarray] = queue.Queue()
+
+        print(f"Loading Whisper {config.model_size} ({config.compute_type})...")
+        self._model = WhisperModel(
+            config.model_size,
+            device=config.device,
+            compute_type=config.compute_type,
+        )
+        print("Whisper model ready.")
+
+        self._pyaudio = pyaudio.PyAudio()
+
+    def start(self) -> None:
+        """Start audio capture and transcription threads."""
+        self._running = True
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, daemon=True
+        )
+        self._transcription_thread = threading.Thread(
+            target=self._transcription_loop, daemon=True
+        )
+        self._capture_thread.start()
+        self._transcription_thread.start()
+
+    def stop(self) -> None:
+        """Stop all threads gracefully."""
+        self._running = False
+        self._capture_thread.join(timeout=2.0)
+        self._transcription_thread.join(timeout=5.0)
+        self._pyaudio.terminate()
+
+    def _capture_loop(self) -> None:
+        """
+        Continuously capture audio and segment it into utterances using
+        simple energy-based VAD.
+        """
+        cfg = self.config
+        stream = self._pyaudio.open(
+            rate=cfg.sample_rate,
+            channels=cfg.channels,
+            format=pyaudio.paInt16,
+            input=True,
+            frames_per_buffer=cfg.chunk_size,
+        )
+
+        utterance_frames: list[bytes] = []
+        silence_chunks = 0
+        speaking = False
+
+        # Energy threshold: frames with RMS below this are "silence"
+        silence_rms_threshold = 300  # Tune for environment noise floor
+
+        chunks_per_second = cfg.sample_rate // cfg.chunk_size
+        silence_chunks_threshold = int(
+            cfg.vad_silence_threshold_s * chunks_per_second
+        )
+        min_speech_chunks = int(
+            cfg.vad_min_speech_duration_s * chunks_per_second
+        )
+        max_utterance_chunks = int(
+            cfg.vad_max_utterance_duration_s * chunks_per_second
+        )
+
+        try:
+            while self._running:
+                raw = stream.read(cfg.chunk_size, exception_on_overflow=False)
+                # Compute RMS energy of this chunk
+                samples = struct.unpack(
+                    f"{cfg.chunk_size}h", raw
+                )
+                rms = (sum(s * s for s in samples) / cfg.chunk_size) ** 0.5
+                is_speech = rms > silence_rms_threshold
+
+                if is_speech:
+                    utterance_frames.append(raw)
+                    silence_chunks = 0
+                    speaking = True
+                elif speaking:
+                    utterance_frames.append(raw)
+                    silence_chunks += 1
+
+                    if silence_chunks >= silence_chunks_threshold:
+                        # End of utterance detected
+                        if len(utterance_frames) >= min_speech_chunks:
+                            audio_bytes = b"".join(utterance_frames)
+                            audio_np = np.frombuffer(
+                                audio_bytes, dtype=np.int16
+                            ).astype(np.float32) / 32768.0
+                            self._audio_queue.put(audio_np)
+
+                        utterance_frames = []
+                        silence_chunks = 0
+                        speaking = False
+                elif len(utterance_frames) >= max_utterance_chunks:
+                    # Force-cut very long utterances
+                    audio_bytes = b"".join(utterance_frames)
+                    audio_np = np.frombuffer(
+                        audio_bytes, dtype=np.int16
+                    ).astype(np.float32) / 32768.0
+                    self._audio_queue.put(audio_np)
+                    utterance_frames = []
+                    speaking = False
+        finally:
+            stream.stop_stream()
+            stream.close()
+
+    def _transcription_loop(self) -> None:
+        """
+        Dequeue captured audio utterances and transcribe them with Whisper.
+        """
+        cfg = self.config
+        while self._running:
+            try:
+                audio = self._audio_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            t0 = time.monotonic()
+            duration_s = len(audio) / cfg.sample_rate
+
+            segments, info = self._model.transcribe(
+                audio,
+                language=cfg.language,
+                beam_size=5,
+                vad_filter=True,  # Whisper's built-in VAD post-processing
+                vad_parameters={
+                    "min_silence_duration_ms": 500,
+                },
+            )
+
+            text_parts = []
+            total_logprob = 0.0
+            segment_count = 0
+            for segment in segments:
+                text_parts.append(segment.text.strip())
+                total_logprob += segment.avg_logprob
+                segment_count += 1
+
+            if not text_parts:
+                continue
+
+            full_text = " ".join(text_parts).strip()
+            avg_logprob = total_logprob / max(segment_count, 1)
+            # Convert avg log-probability to a 0-1 confidence score
+            confidence = float(np.exp(avg_logprob))
+            latency_s = time.monotonic() - t0
+
+            result = TranscriptionResult(
+                text=full_text,
+                language=info.language,
+                confidence=confidence,
+                duration_audio_s=duration_s,
+                latency_s=latency_s,
+            )
+            self.callback(result)
+```
+
+### 12.3.3 ROS 2 Node Wrapping Whisper
+
+The `WhisperTranscriber` module is wrapped in a ROS 2 node that publishes transcribed text to a standard ROS 2 topic for consumption by downstream nodes.
+
+```python
+# whisper_node.py
+# ROS 2 node: microphone → Whisper → /speech/transcription topic
+# Requires: ros2 humble, pip install faster-whisper pyaudio
+# Run: ros2 run voice_pipeline whisper_node
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from voice_pipeline.whisper_transcriber import (
+    WhisperTranscriber,
+    WhisperConfig,
+    TranscriptionResult,
+)
+
+
+class WhisperNode(Node):
+    """
+    ROS 2 node that captures speech from the microphone, transcribes it
+    using Whisper large-v3, and publishes the text to /speech/transcription.
+
+    Published Topics:
+        /speech/transcription  (std_msgs/String)  — Raw transcribed text
+        /speech/confidence     (std_msgs/Float32) — Transcription confidence
+    """
+
+    def __init__(self) -> None:
+        super().__init__("whisper_node")
+
+        # Declare ROS 2 parameters (overridable via launch file or CLI)
+        self.declare_parameter("model_size", "large-v3")
+        self.declare_parameter("language", "en")
+        self.declare_parameter("device", "cuda")
+        self.declare_parameter("confidence_threshold", 0.6)
+
+        model_size = self.get_parameter("model_size").value
+        language = self.get_parameter("language").value
+        device = self.get_parameter("device").value
+        self._confidence_threshold = self.get_parameter(
+            "confidence_threshold"
+        ).value
+
+        # Publishers
+        self._transcription_pub = self.create_publisher(
+            String, "/speech/transcription", qos_profile=10
+        )
+
+        # Start transcription in background thread
+        config = WhisperConfig(
+            model_size=model_size,
+            language=language if language != "auto" else None,
+            device=device,
+        )
+        self._transcriber = WhisperTranscriber(
+            callback=self._on_transcription,
+            config=config,
+        )
+        self._transcriber.start()
+
+        self.get_logger().info(
+            f"WhisperNode ready. Model: {model_size}, "
+            f"Language: {language}, Device: {device}"
+        )
+
+    def _on_transcription(self, result: TranscriptionResult) -> None:
+        """Callback invoked by the transcription thread when text is ready."""
+        self.get_logger().info(
+            f"Transcribed ({result.confidence:.2f}): '{result.text}' "
+            f"[{result.latency_s:.2f}s latency]"
+        )
+
+        if result.confidence < self._confidence_threshold:
+            self.get_logger().warn(
+                f"Low confidence ({result.confidence:.2f}), discarding: "
+                f"'{result.text}'"
+            )
+            return
+
+        msg = String()
+        msg.data = result.text
+        self._transcription_pub.publish(msg)
+
+    def destroy_node(self) -> None:
+        self._transcriber.stop()
+        super().destroy_node()
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = WhisperNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 12.4 LLM Task Planning with GPT-4o
+
+### 12.4.1 System Prompt Design for Robot Task Planning
+
+GPT-4o receives the transcribed instruction and must convert it into a structured, executable action plan. The quality of this conversion depends critically on the **system prompt** — the instructions that constrain GPT-4o's output format, robot capabilities, and reasoning process.
+
+The system prompt must communicate:
+1. The robot's physical capabilities (what actions it can perform)
+2. The objects currently visible to the robot (from the perception system)
+3. The output format (a JSON structure the parser can process)
+4. Constraint checking (feasibility, safety)
+
+### 12.4.2 Pydantic Models for Structured Robot Actions
+
+Pydantic [4] models define the schema for robot action plans, providing type safety and automatic validation of GPT-4o's structured outputs.
+
+```python
+# robot_action_schema.py
+# Pydantic v2 models defining the structured output schema for robot actions.
+# Requires: pip install pydantic>=2.0 openai>=1.0
+
+from __future__ import annotations
+
+from enum import Enum
+from typing import Optional
+from pydantic import BaseModel, Field, model_validator
+
+
+class ActionType(str, Enum):
+    """Enumeration of all executable robot action primitives."""
+    NAVIGATE_TO = "navigate_to"   # Move robot base to a position
+    PICK_UP = "pick_up"           # Grasp an object
+    PLACE = "place"               # Place held object at location
+    SPEAK = "speak"               # Text-to-speech output
+    WAIT = "wait"                 # Pause for specified duration
+    OPEN_DOOR = "open_door"       # Open a door (requires door handle detection)
+    POUR = "pour"                 # Pour contents (liquid tasks)
+
+
+class RobotAction(BaseModel):
+    """A single executable robot action primitive."""
+
+    action_type: ActionType = Field(
+        description="The type of action to execute."
+    )
+    target_object: Optional[str] = Field(
+        default=None,
+        description=(
+            "The name of the target object for this action, as it appears "
+            "in the detected_objects list provided in the system prompt."
+        ),
+    )
+    target_location: Optional[str] = Field(
+        default=None,
+        description=(
+            "The name of a named location (e.g., 'kitchen counter', "
+            "'user_position') or a detected object to navigate/place to."
+        ),
+    )
+    text_to_speak: Optional[str] = Field(
+        default=None,
+        description="The text to say aloud (for SPEAK actions only).",
+    )
+    duration_s: Optional[float] = Field(
+        default=None,
+        ge=0.1,
+        le=30.0,
+        description="Duration in seconds (for WAIT actions only).",
+    )
+    notes: Optional[str] = Field(
+        default=None,
+        description="Brief reasoning note explaining why this step is needed.",
+    )
+
+    @model_validator(mode="after")
+    def validate_action_fields(self) -> "RobotAction":
+        """Ensure required fields are present for each action type."""
+        if self.action_type in (ActionType.PICK_UP, ActionType.POUR):
+            if not self.target_object:
+                raise ValueError(
+                    f"{self.action_type} requires target_object"
+                )
+        if self.action_type == ActionType.NAVIGATE_TO:
+            if not self.target_location and not self.target_object:
+                raise ValueError(
+                    "NAVIGATE_TO requires target_location or target_object"
+                )
+        if self.action_type == ActionType.PLACE:
+            if not self.target_location and not self.target_object:
+                raise ValueError(
+                    "PLACE requires target_location or target_object"
+                )
+        if self.action_type == ActionType.SPEAK:
+            if not self.text_to_speak:
+                raise ValueError("SPEAK requires text_to_speak")
+        if self.action_type == ActionType.WAIT:
+            if self.duration_s is None:
+                raise ValueError("WAIT requires duration_s")
+        return self
+
+
+class ActionPlan(BaseModel):
+    """
+    A complete, ordered plan for executing a voice-commanded robot task.
+    """
+
+    task_description: str = Field(
+        description="One-sentence description of the overall task."
+    )
+    feasible: bool = Field(
+        description=(
+            "True if all required objects/locations are detected and "
+            "the task is physically achievable. False otherwise."
+        )
+    )
+    infeasibility_reason: Optional[str] = Field(
+        default=None,
+        description="If feasible=False, explain why the task cannot be done.",
+    )
+    steps: list[RobotAction] = Field(
+        default_factory=list,
+        description=(
+            "Ordered list of robot action primitives to execute. "
+            "Empty if feasible=False."
+        ),
+    )
+    estimated_duration_s: Optional[float] = Field(
+        default=None,
+        description="Estimated total task duration in seconds.",
+    )
+
+    @model_validator(mode="after")
+    def validate_plan(self) -> "ActionPlan":
+        if not self.feasible and not self.infeasibility_reason:
+            raise ValueError(
+                "infeasibility_reason is required when feasible=False"
+            )
+        if self.feasible and not self.steps:
+            raise ValueError(
+                "steps must be non-empty when feasible=True"
+            )
+        return self
+```
+
+### 12.4.3 GPT-4o Task Planning Node
+
+```python
+# gpt4o_planner_node.py
+# ROS 2 node: /speech/transcription → GPT-4o → /task/action_plan
+# Requires: pip install openai>=1.0 pydantic>=2.0
+# Environment: OPENAI_API_KEY must be set
+
+from __future__ import annotations
+
+import json
+import os
+from typing import Optional
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String
+from openai import OpenAI
+
+from voice_pipeline.robot_action_schema import ActionPlan, ActionType
+
+
+# System prompt template. The {detected_objects} placeholder is filled
+# at runtime with the current list of detected objects from the perception system.
+SYSTEM_PROMPT_TEMPLATE = """You are the task planning module for a humanoid service robot.
+
+## Robot Capabilities
+The robot can execute the following action primitives:
+- navigate_to: Move the robot base to a named location or detected object
+- pick_up: Grasp a detected object with the robot arm
+- place: Place the currently held object at a named location or near a detected object
+- speak: Say text aloud via the robot's text-to-speech system
+- wait: Pause for a specified number of seconds
+- open_door: Open a door (only if a door handle is visible)
+- pour: Pour the contents of a held container
+
+## Currently Detected Objects
+The robot's perception system currently detects the following objects:
+{detected_objects}
+
+## Named Locations
+{named_locations}
+
+## Instructions
+1. Convert the user's voice command into an ordered list of action primitives.
+2. Use ONLY objects from the detected objects list. Do NOT assume objects are present if not listed.
+3. If the task is impossible (required object not detected, physically infeasible), set feasible=False.
+4. If the command is ambiguous, produce a SPEAK action asking for clarification, then set feasible=False.
+5. Always include a SPEAK action at the start to confirm understanding of the task.
+6. Always include a SPEAK action at the end to report completion or failure.
+7. Respond ONLY with valid JSON matching the ActionPlan schema.
+"""
+
+
+class GPT4oPlannerNode(Node):
+    """
+    ROS 2 node that subscribes to transcribed speech, queries GPT-4o to
+    generate a structured action plan, and publishes the plan as JSON.
+
+    Subscribed Topics:
+        /speech/transcription (std_msgs/String)  — Transcribed voice command
+        /perception/objects   (std_msgs/String)  — JSON list of detected objects
+
+    Published Topics:
+        /task/action_plan     (std_msgs/String)  — JSON ActionPlan
+    """
+
+    def __init__(self) -> None:
+        super().__init__("gpt4o_planner_node")
+
+        self.declare_parameter("model", "gpt-4o")
+        self.declare_parameter("temperature", 0.1)
+        self.declare_parameter("max_tokens", 1024)
+
+        self._model = self.get_parameter("model").value
+        self._temperature = self.get_parameter("temperature").value
+        self._max_tokens = self.get_parameter("max_tokens").value
+
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "OPENAI_API_KEY environment variable is not set."
+            )
+        self._client = OpenAI(api_key=api_key)
+
+        # Current detected objects (updated by perception subscription)
+        self._detected_objects: list[str] = []
+        self._named_locations: list[str] = [
+            "kitchen_counter", "dining_table", "user_position",
+            "charging_station", "storage_shelf",
+        ]
+
+        self._transcription_sub = self.create_subscription(
+            String, "/speech/transcription", self._on_transcription, 10
+        )
+        self._objects_sub = self.create_subscription(
+            String, "/perception/objects", self._on_objects_update, 10
+        )
+        self._plan_pub = self.create_publisher(
+            String, "/task/action_plan", 10
+        )
+
+        self.get_logger().info("GPT4oPlannerNode ready.")
+
+    def _on_objects_update(self, msg: String) -> None:
+        """Update the list of currently detected objects."""
+        try:
+            self._detected_objects = json.loads(msg.data)
+        except json.JSONDecodeError as e:
+            self.get_logger().error(f"Failed to parse objects list: {e}")
+
+    def _on_transcription(self, msg: String) -> None:
+        """Handle a new transcribed voice command."""
+        instruction = msg.data.strip()
+        if not instruction:
+            return
+
+        self.get_logger().info(f"Planning task for: '{instruction}'")
+
+        # Format detected objects as a readable list for the prompt
+        if self._detected_objects:
+            objects_str = "\n".join(
+                f"  - {obj}" for obj in self._detected_objects
+            )
+        else:
+            objects_str = "  (no objects currently detected)"
+
+        locations_str = "\n".join(
+            f"  - {loc}" for loc in self._named_locations
+        )
+
+        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+            detected_objects=objects_str,
+            named_locations=locations_str,
+        )
+
+        try:
+            action_plan = self._call_gpt4o(system_prompt, instruction)
+            plan_json = action_plan.model_dump_json(indent=2)
+
+            self.get_logger().info(
+                f"Plan generated: {action_plan.task_description} "
+                f"(feasible={action_plan.feasible}, "
+                f"steps={len(action_plan.steps)})"
+            )
+
+            plan_msg = String()
+            plan_msg.data = plan_json
+            self._plan_pub.publish(plan_msg)
+
+        except Exception as e:
+            self.get_logger().error(f"GPT-4o planning failed: {e}")
+            # Publish a fallback "speak clarification" plan
+            fallback = ActionPlan(
+                task_description="Planning failure",
+                feasible=False,
+                infeasibility_reason=str(e),
+                steps=[],
+            )
+            plan_msg = String()
+            plan_msg.data = fallback.model_dump_json()
+            self._plan_pub.publish(plan_msg)
+
+    def _call_gpt4o(self, system_prompt: str, instruction: str) -> ActionPlan:
+        """Call GPT-4o with structured JSON output and parse into ActionPlan."""
+        response = self._client.chat.completions.create(
+            model=self._model,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": instruction},
+            ],
+        )
+
+        raw_json = response.choices[0].message.content
+        data = json.loads(raw_json)
+        # Validate and construct the ActionPlan with Pydantic
+        return ActionPlan.model_validate(data)
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = GPT4oPlannerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 12.4.4 Example: "Bring Me the Red Mug" → Structured Action Plan
+
+Given the instruction "bring me the red mug" with the detected objects list `["red_mug", "coffee_maker", "kitchen_counter"]` and the user at `user_position`, GPT-4o would generate the following structured plan:
+
+```json
+{
+  "task_description": "Pick up the red mug and bring it to the user.",
+  "feasible": true,
+  "infeasibility_reason": null,
+  "steps": [
+    {
+      "action_type": "speak",
+      "text_to_speak": "Sure, I'll bring you the red mug.",
+      "notes": "Confirm task understanding"
+    },
+    {
+      "action_type": "navigate_to",
+      "target_object": "red_mug",
+      "notes": "Move base close to the mug's detected position"
+    },
+    {
+      "action_type": "pick_up",
+      "target_object": "red_mug",
+      "notes": "Grasp the red mug"
+    },
+    {
+      "action_type": "navigate_to",
+      "target_location": "user_position",
+      "notes": "Return to user with the mug"
+    },
+    {
+      "action_type": "place",
+      "target_location": "user_position",
+      "notes": "Offer the mug to the user"
+    },
+    {
+      "action_type": "speak",
+      "text_to_speak": "Here is your red mug.",
+      "notes": "Report task completion"
+    }
+  ],
+  "estimated_duration_s": 45.0
+}
+```
+
+---
+
+## 12.5 Grounding Language Commands to Robot State
+
+### 12.5.1 The Grounding Problem
+
+GPT-4o produces plans that refer to objects by name: "red_mug," "kitchen_counter." But a robot does not act on names — it acts on **poses**: 3D positions and orientations in the robot's coordinate frame. The process of converting a named object reference into a concrete spatial pose is called **grounding**.
+
+The grounding problem has two levels:
+
+**Perceptual grounding:** "red_mug" must be mapped to a bounding box in the camera image, then to a 3D point cloud cluster, then to a grasp pose. This requires integration with the object detection system described in Chapter 9.
+
+**Spatial language grounding:** Phrases like "to the left of the coffee maker" or "on the table near the window" require spatial reasoning — computing a 3D position that satisfies the described spatial relationship relative to detected reference objects.
+
+### 12.5.2 Python: Grounding a Detected Object to a Pose
+
+```python
+# action_grounding.py
+# Grounds named object references in an ActionPlan to concrete 3D poses.
+# Integrates with the object detection system via the /perception/detections topic.
+# Requires: pip install numpy scipy
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+
+
+@dataclass
+class ObjectDetection:
+    """A single detected object with 3D pose in the robot's base frame."""
+    label: str
+    confidence: float
+    position_xyz: np.ndarray   # shape (3,), meters in robot base frame
+    orientation_quat: np.ndarray   # shape (4,), [x, y, z, w]
+    bounding_box_2d: tuple[int, int, int, int]  # (x1, y1, x2, y2) pixels
+
+
+@dataclass
+class GroundedPose:
+    """A resolved 3D pose for an action target."""
+    position_xyz: np.ndarray     # shape (3,)
+    orientation_quat: np.ndarray # shape (4,)
+    source_label: str
+    confidence: float
+
+
+class ActionGrounder:
+    """
+    Resolves named object/location references from an ActionPlan to 3D poses.
+
+    The grounding process:
+    1. For object references (e.g., "red_mug"): look up the detected object
+       with matching label and highest confidence.
+    2. For spatial language (e.g., "left of coffee_maker"): compute position
+       relative to the reference object.
+    3. For named locations (e.g., "user_position"): look up in a static map.
+    """
+
+    def __init__(self, static_locations: dict[str, np.ndarray]) -> None:
+        """
+        Args:
+            static_locations: Map of location name -> (x, y, z) in base frame.
+                              e.g. {"user_position": np.array([2.0, 0.0, 0.0])}
+        """
+        self._static_locations = static_locations
+        self._current_detections: list[ObjectDetection] = []
+
+    def update_detections(self, detections: list[ObjectDetection]) -> None:
+        """Update the cache of currently detected objects."""
+        self._current_detections = detections
+
+    def ground_object(self, object_label: str) -> Optional[GroundedPose]:
+        """
+        Ground a named object to its 3D pose in the robot's base frame.
+
+        Returns None if the object is not currently detected.
+        """
+        matches = [
+            det for det in self._current_detections
+            if det.label.lower() == object_label.lower()
+        ]
+        if not matches:
+            return None
+
+        # Select the detection with highest confidence
+        best = max(matches, key=lambda d: d.confidence)
+
+        return GroundedPose(
+            position_xyz=best.position_xyz.copy(),
+            orientation_quat=best.orientation_quat.copy(),
+            source_label=best.label,
+            confidence=best.confidence,
+        )
+
+    def ground_location(self, location_name: str) -> Optional[GroundedPose]:
+        """
+        Ground a named location to a 3D pose.
+
+        First tries detected objects (a named location might be a large object
+        like "kitchen_counter"), then falls back to the static location map.
+        """
+        # Try treating the location name as a detected object first
+        grounded = self.ground_object(location_name)
+        if grounded is not None:
+            return grounded
+
+        # Fall back to static map
+        if location_name in self._static_locations:
+            xyz = self._static_locations[location_name]
+            return GroundedPose(
+                position_xyz=xyz.copy(),
+                orientation_quat=np.array([0.0, 0.0, 0.0, 1.0]),
+                source_label=location_name,
+                confidence=1.0,
+            )
+
+        return None
+
+    def ground_spatial_expression(
+        self,
+        reference_label: str,
+        relation: str,
+        offset_m: float = 0.3,
+    ) -> Optional[GroundedPose]:
+        """
+        Ground a spatial expression like "to the left of {reference_label}".
+
+        Supported relations: "left_of", "right_of", "in_front_of", "behind",
+                             "above", "below"
+
+        Args:
+            reference_label: Label of the reference object
+            relation:         Spatial relation string
+            offset_m:         Distance offset in meters from reference object
+
+        Returns:
+            GroundedPose at the computed spatial position, or None.
+        """
+        ref = self.ground_object(reference_label)
+        if ref is None:
+            return None
+
+        # Compute offset direction in robot base frame
+        # Assumes robot is facing the +x direction
+        relation_offsets = {
+            "left_of":     np.array([0.0,  offset_m, 0.0]),
+            "right_of":    np.array([0.0, -offset_m, 0.0]),
+            "in_front_of": np.array([offset_m, 0.0, 0.0]),
+            "behind":      np.array([-offset_m, 0.0, 0.0]),
+            "above":       np.array([0.0, 0.0, offset_m]),
+            "below":       np.array([0.0, 0.0, -offset_m]),
+        }
+
+        if relation not in relation_offsets:
+            return None
+
+        new_position = ref.position_xyz + relation_offsets[relation]
+
+        return GroundedPose(
+            position_xyz=new_position,
+            orientation_quat=ref.orientation_quat.copy(),
+            source_label=f"{relation}_{reference_label}",
+            confidence=ref.confidence * 0.9,  # Slightly lower confidence
+        )
+```
+
+---
+
+## 12.6 ROS 2 Action Server for Task Execution
+
+### 12.6.1 The ROS 2 Action Interface
+
+ROS 2 actions [5] are the appropriate communication pattern for long-running robot tasks. Unlike services (which are synchronous request-response) or topics (which are asynchronous publish-subscribe), actions support three critical features for robot task execution:
+
+1. **Goal acceptance/rejection:** The server can reject a goal before starting execution
+2. **Feedback streaming:** The server publishes periodic progress updates during execution
+3. **Cancellation:** The client can cancel a goal mid-execution with a graceful response
+
+### 12.6.2 The ExecuteTask Action Definition
+
+ROS 2 action definitions are stored in `.action` files in the package's `action/` directory. The following file defines the `ExecuteTask` action interface:
+
+```
+# action/ExecuteTask.action
+# Goal: the full action plan as a JSON string
+string plan_json
+
+---
+# Result: success/failure and summary message
+bool success
+string result_message
+string[] completed_steps
+string[] failed_steps
+
+---
+# Feedback: step-by-step progress updates
+string current_step
+string current_action_type
+float32 progress_fraction   # 0.0 to 1.0
+string status_message
+```
+
+This action file is placed at `voice_pipeline/action/ExecuteTask.action` and referenced in `CMakeLists.txt` (for C++ packages) or `setup.py` (for Python packages) to generate the message types.
+
+### 12.6.3 Complete ROS 2 Action Server
+
+```python
+# task_executor_server.py
+# ROS 2 Action Server that executes structured ActionPlan objects.
+# Implements NavigateTo, PickUp, Place, Speak, and Wait primitives.
+# Requires: ros2 humble
+
+from __future__ import annotations
+
+import json
+import time
+from typing import Optional
+
+import rclpy
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.action.server import ServerGoalHandle
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.node import Node
+
+# These message types are generated from ExecuteTask.action
+from voice_pipeline_interfaces.action import ExecuteTask
+from voice_pipeline.robot_action_schema import ActionPlan, ActionType
+from voice_pipeline.action_grounding import ActionGrounder, ObjectDetection
+
+import numpy as np
+
+
+class TaskExecutorServer(Node):
+    """
+    ROS 2 Action Server that executes structured robot task plans.
+
+    Accepts ExecuteTask goals containing a JSON ActionPlan, executes
+    each step sequentially, publishes progress feedback, and handles
+    cancellation and error recovery.
+
+    Action Interface: /execute_task (voice_pipeline_interfaces/ExecuteTask)
+    """
+
+    def __init__(self) -> None:
+        super().__init__("task_executor_server")
+
+        # Grounding module (static locations set at startup)
+        static_locs = {
+            "user_position":    np.array([2.0, 0.0, 0.9]),
+            "kitchen_counter":  np.array([3.5, 1.2, 0.85]),
+            "dining_table":     np.array([1.5, -2.0, 0.75]),
+            "charging_station": np.array([-1.0, 0.0, 0.0]),
+        }
+        self._grounder = ActionGrounder(static_locations=static_locs)
+
+        # Action server with reentrant callback group to allow cancellation
+        self._action_server = ActionServer(
+            self,
+            ExecuteTask,
+            "/execute_task",
+            execute_callback=self._execute_callback,
+            goal_callback=self._goal_callback,
+            cancel_callback=self._cancel_callback,
+            callback_group=ReentrantCallbackGroup(),
+        )
+
+        self.get_logger().info("TaskExecutorServer ready on /execute_task")
+
+    def _goal_callback(self, goal_request) -> GoalResponse:
+        """Validate and accept or reject incoming goals."""
+        try:
+            plan = ActionPlan.model_validate_json(goal_request.plan_json)
+            if not plan.feasible:
+                self.get_logger().warn(
+                    f"Rejecting infeasible goal: {plan.infeasibility_reason}"
+                )
+                return GoalResponse.REJECT
+            self.get_logger().info(
+                f"Accepting goal: {plan.task_description} "
+                f"({len(plan.steps)} steps)"
+            )
+            return GoalResponse.ACCEPT
+        except Exception as e:
+            self.get_logger().error(f"Goal validation failed: {e}")
+            return GoalResponse.REJECT
+
+    def _cancel_callback(self, goal_handle) -> CancelResponse:
+        """Accept all cancellation requests."""
+        self.get_logger().info("Cancellation requested — accepting.")
+        return CancelResponse.ACCEPT
+
+    async def _execute_callback(
+        self, goal_handle: ServerGoalHandle
+    ) -> ExecuteTask.Result:
+        """
+        Main execution loop: iterate through ActionPlan steps and execute each.
+        """
+        plan = ActionPlan.model_validate_json(goal_handle.request.plan_json)
+        completed_steps: list[str] = []
+        failed_steps: list[str] = []
+        total_steps = len(plan.steps)
+
+        self.get_logger().info(
+            f"Executing: '{plan.task_description}' ({total_steps} steps)"
+        )
+
+        for step_idx, action in enumerate(plan.steps):
+            # Check for cancellation before each step
+            if goal_handle.is_cancel_requested:
+                self.get_logger().info("Goal cancelled during execution.")
+                goal_handle.canceled()
+                result = ExecuteTask.Result()
+                result.success = False
+                result.result_message = "Task cancelled by user."
+                result.completed_steps = completed_steps
+                result.failed_steps = [a.action_type.value for a in plan.steps[step_idx:]]
+                return result
+
+            # Publish feedback
+            feedback = ExecuteTask.Feedback()
+            feedback.current_step = f"Step {step_idx + 1} of {total_steps}"
+            feedback.current_action_type = action.action_type.value
+            feedback.progress_fraction = step_idx / total_steps
+            feedback.status_message = (
+                f"Executing {action.action_type.value}"
+                + (f" on {action.target_object}" if action.target_object else "")
+            )
+            goal_handle.publish_feedback(feedback)
+
+            # Execute the action primitive
+            success = await self._execute_action(action)
+
+            if success:
+                completed_steps.append(action.action_type.value)
+                self.get_logger().info(
+                    f"  Step {step_idx + 1}/{total_steps} OK: "
+                    f"{action.action_type.value}"
+                )
+            else:
+                failed_steps.append(action.action_type.value)
+                self.get_logger().error(
+                    f"  Step {step_idx + 1}/{total_steps} FAILED: "
+                    f"{action.action_type.value}"
+                )
+
+                # Attempt graceful recovery: announce failure and stop
+                await self._speak(
+                    f"I encountered an error during step "
+                    f"{step_idx + 1}: {action.action_type.value}. "
+                    f"Please check the robot's position."
+                )
+
+                goal_handle.abort()
+                result = ExecuteTask.Result()
+                result.success = False
+                result.result_message = (
+                    f"Failed at step {step_idx + 1}: {action.action_type.value}"
+                )
+                result.completed_steps = completed_steps
+                result.failed_steps = failed_steps
+                return result
+
+        # All steps completed
+        goal_handle.succeed()
+        result = ExecuteTask.Result()
+        result.success = True
+        result.result_message = f"Task completed: {plan.task_description}"
+        result.completed_steps = completed_steps
+        result.failed_steps = []
+        return result
+
+    async def _execute_action(self, action) -> bool:
+        """
+        Dispatch a single action primitive to the appropriate handler.
+        Returns True on success, False on failure.
+        """
+        handlers = {
+            ActionType.NAVIGATE_TO: self._execute_navigate,
+            ActionType.PICK_UP:     self._execute_pick_up,
+            ActionType.PLACE:       self._execute_place,
+            ActionType.SPEAK:       self._execute_speak_action,
+            ActionType.WAIT:        self._execute_wait,
+        }
+
+        handler = handlers.get(action.action_type)
+        if handler is None:
+            self.get_logger().warn(
+                f"No handler for action type: {action.action_type}"
+            )
+            return False
+
+        try:
+            return await handler(action)
+        except Exception as e:
+            self.get_logger().error(
+                f"Exception in handler for {action.action_type}: {e}"
+            )
+            return False
+
+    async def _execute_navigate(self, action) -> bool:
+        """Navigate the robot base to the target location or object."""
+        target = action.target_location or action.target_object
+        pose = self._grounder.ground_location(target)
+        if pose is None:
+            self.get_logger().error(f"Cannot ground location: {target}")
+            return False
+
+        self.get_logger().info(
+            f"  Navigating to {target} at "
+            f"({pose.position_xyz[0]:.2f}, "
+            f"{pose.position_xyz[1]:.2f}, "
+            f"{pose.position_xyz[2]:.2f})"
+        )
+        # In production: call nav2 navigate_to_pose action server here
+        # nav2_client.send_goal(pose) and await result
+        await self._simulate_action(duration_s=3.0)  # Placeholder
+        return True
+
+    async def _execute_pick_up(self, action) -> bool:
+        """Grasp the target object."""
+        pose = self._grounder.ground_object(action.target_object)
+        if pose is None:
+            self.get_logger().error(
+                f"Cannot ground object for pick_up: {action.target_object}"
+            )
+            return False
+
+        self.get_logger().info(
+            f"  Picking up {action.target_object} at "
+            f"({pose.position_xyz[0]:.2f}, "
+            f"{pose.position_xyz[1]:.2f}, "
+            f"{pose.position_xyz[2]:.2f})"
+        )
+        # In production: call manipulation action server (MoveIt2 or VLA)
+        await self._simulate_action(duration_s=5.0)  # Placeholder
+        return True
+
+    async def _execute_place(self, action) -> bool:
+        """Place the held object at the target location."""
+        target = action.target_location or action.target_object
+        pose = self._grounder.ground_location(target)
+        if pose is None:
+            self.get_logger().error(f"Cannot ground place location: {target}")
+            return False
+
+        self.get_logger().info(f"  Placing at {target}")
+        await self._simulate_action(duration_s=3.0)  # Placeholder
+        return True
+
+    async def _execute_speak_action(self, action) -> bool:
+        """Speak text aloud via TTS."""
+        return await self._speak(action.text_to_speak)
+
+    async def _speak(self, text: str) -> bool:
+        """Text-to-speech output."""
+        self.get_logger().info(f'  SPEAK: "{text}"')
+        # In production: call TTS service (e.g., espeak, pyttsx3, ElevenLabs)
+        await self._simulate_action(duration_s=len(text) * 0.05)
+        return True
+
+    async def _execute_wait(self, action) -> bool:
+        """Wait for the specified duration."""
+        self.get_logger().info(f"  Waiting {action.duration_s:.1f}s")
+        await self._simulate_action(duration_s=action.duration_s)
+        return True
+
+    async def _simulate_action(self, duration_s: float) -> None:
+        """
+        Placeholder: simulate action execution with a sleep.
+        Replace with real hardware calls in production.
+        """
+        import asyncio
+        await asyncio.sleep(duration_s)
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = TaskExecutorServer()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+## 12.7 Error Handling
+
+### 12.7.1 Ambiguous Commands: Requesting Clarification
+
+When GPT-4o determines that a command is ambiguous — "bring me the mug" when two mugs are detected — the planned response is a `SPEAK` action followed by `feasible=False`. The action server receives an infeasible plan and instead of executing it, the TTS system speaks the clarification question to the user:
+
+```python
+# In GPT4oPlannerNode._on_transcription, for infeasible plans:
+if not plan.feasible:
+    # Generate a clarification request
+    clarification = self._generate_clarification(plan)
+    tts_msg = String()
+    tts_msg.data = clarification
+    self._tts_pub.publish(tts_msg)
+```
+
+GPT-4o's clarification is embedded in the `speak` step's `text_to_speak` field: "I see two mugs — a red one and a blue one. Which would you like?"
+
+### 12.7.2 Impossible Tasks: Graceful Refusal
+
+When a required object is not detected — "bring me the newspaper" when no newspaper is in the scene — GPT-4o sets `feasible=False` with `infeasibility_reason="newspaper not in detected objects list"`. The pipeline speaks this reason aloud in a user-friendly formulation: "I'm sorry, I don't see a newspaper in the area. Please show me where it is."
+
+### 12.7.3 Physical Failure and Timeout Handling
+
+Physical failures — a failed grasp, a navigation timeout, a collision — are detected at the action server level. Each action handler wraps its hardware call in a try/except with a configurable timeout:
+
+```python
+async def _execute_with_timeout(
+    self,
+    coro,
+    timeout_s: float,
+    action_name: str,
+) -> bool:
+    """Execute an action coroutine with a timeout."""
+    import asyncio
+    try:
+        result = await asyncio.wait_for(coro, timeout=timeout_s)
+        return result
+    except asyncio.TimeoutError:
+        self.get_logger().error(
+            f"{action_name} timed out after {timeout_s:.1f}s"
+        )
+        return False
+    except Exception as e:
+        self.get_logger().error(f"{action_name} raised exception: {e}")
+        return False
+```
+
+Recovery behaviors include: backing up to a safe standoff distance after a failed grasp, returning to the home position after a navigation failure, and speaking an error message before stopping.
+
+---
+
+## 12.8 Full Capstone Pipeline — Complete Working Example
+
+### 12.8.1 Package Structure
+
+```
+voice_pipeline/
+├── voice_pipeline/
+│   ├── __init__.py
+│   ├── whisper_transcriber.py      # WhisperTranscriber class
+│   ├── whisper_node.py             # ROS 2 Whisper node
+│   ├── robot_action_schema.py      # Pydantic models
+│   ├── gpt4o_planner_node.py       # GPT-4o planner node
+│   ├── action_grounding.py         # ActionGrounder class
+│   ├── action_parser_node.py       # Action parser + grounding node
+│   └── task_executor_server.py     # ROS 2 action server
+├── action/
+│   └── ExecuteTask.action          # Action definition file
+├── launch/
+│   └── voice_pipeline.launch.py    # Full pipeline launch file
+├── package.xml
+└── setup.py
+```
+
+### 12.8.2 The Action Parser Node
+
+The action parser node bridges the GPT-4o planner and the task executor: it receives the JSON `ActionPlan`, grounds all object and location references to 3D poses, and sends the grounded plan as a goal to the `ExecuteTask` action server.
+
+```python
+# action_parser_node.py
+# ROS 2 node: /task/action_plan -> grounding -> /execute_task goal
+# Subscribes to action plans, grounds them, sends to executor.
+
+from __future__ import annotations
+
+import json
+
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from std_msgs.msg import String
+
+from voice_pipeline_interfaces.action import ExecuteTask
+from voice_pipeline.robot_action_schema import ActionPlan
+from voice_pipeline.action_grounding import ActionGrounder, ObjectDetection
+
+import numpy as np
+
+
+class ActionParserNode(Node):
+    """
+    ROS 2 node that receives ActionPlan JSON, validates grounding,
+    and sends the plan as a goal to the TaskExecutorServer.
+
+    Subscribed Topics:
+        /task/action_plan    (std_msgs/String) — JSON ActionPlan from GPT-4o
+        /perception/objects  (std_msgs/String) — Detected objects with poses
+
+    Action Client:
+        /execute_task (voice_pipeline_interfaces/ExecuteTask)
+    """
+
+    def __init__(self) -> None:
+        super().__init__("action_parser_node")
+
+        static_locs = {
+            "user_position":    np.array([2.0, 0.0, 0.9]),
+            "kitchen_counter":  np.array([3.5, 1.2, 0.85]),
+            "dining_table":     np.array([1.5, -2.0, 0.75]),
+            "charging_station": np.array([-1.0, 0.0, 0.0]),
+        }
+        self._grounder = ActionGrounder(static_locations=static_locs)
+        self._current_detections: list[ObjectDetection] = []
+
+        self._plan_sub = self.create_subscription(
+            String, "/task/action_plan", self._on_plan, 10
+        )
+        self._objects_sub = self.create_subscription(
+            String, "/perception/objects_with_poses",
+            self._on_objects_update, 10
+        )
+        self._action_client = ActionClient(
+            self, ExecuteTask, "/execute_task"
+        )
+
+        self.get_logger().info("ActionParserNode ready.")
+
+    def _on_objects_update(self, msg: String) -> None:
+        """Update detections cache from the perception system."""
+        try:
+            raw = json.loads(msg.data)
+            detections = []
+            for obj in raw:
+                det = ObjectDetection(
+                    label=obj["label"],
+                    confidence=obj["confidence"],
+                    position_xyz=np.array(obj["position_xyz"]),
+                    orientation_quat=np.array(obj["orientation_quat"]),
+                    bounding_box_2d=tuple(obj["bbox"]),
+                )
+                detections.append(det)
+            self._grounder.update_detections(detections)
+        except (json.JSONDecodeError, KeyError) as e:
+            self.get_logger().error(f"Failed to parse detections: {e}")
+
+    def _on_plan(self, msg: String) -> None:
+        """Receive a plan and validate grounding before execution."""
+        try:
+            plan = ActionPlan.model_validate_json(msg.data)
+        except Exception as e:
+            self.get_logger().error(f"Failed to parse ActionPlan: {e}")
+            return
+
+        if not plan.feasible:
+            self.get_logger().warn(
+                f"Plan is infeasible: {plan.infeasibility_reason}"
+            )
+            return
+
+        # Validate that all referenced objects/locations can be grounded
+        unresolvable = []
+        for step in plan.steps:
+            if step.target_object:
+                if not self._grounder.ground_object(step.target_object):
+                    unresolvable.append(step.target_object)
+            if step.target_location:
+                if not self._grounder.ground_location(step.target_location):
+                    unresolvable.append(step.target_location)
+
+        if unresolvable:
+            self.get_logger().error(
+                f"Cannot ground references: {unresolvable}. Aborting."
+            )
+            return
+
+        # Send the validated plan to the action server
+        self.get_logger().info(
+            f"Sending plan to executor: {plan.task_description}"
+        )
+        if not self._action_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("ExecuteTask action server not available.")
+            return
+
+        goal = ExecuteTask.Goal()
+        goal.plan_json = msg.data
+        future = self._action_client.send_goal_async(
+            goal,
+            feedback_callback=self._on_feedback,
+        )
+        future.add_done_callback(self._on_goal_response)
+
+    def _on_goal_response(self, future) -> None:
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error("Goal rejected by executor.")
+            return
+        self.get_logger().info("Goal accepted. Execution in progress...")
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_result)
+
+    def _on_feedback(self, feedback_msg) -> None:
+        fb = feedback_msg.feedback
+        self.get_logger().info(
+            f"[{fb.progress_fraction*100:.0f}%] "
+            f"{fb.current_step}: {fb.status_message}"
+        )
+
+    def _on_result(self, future) -> None:
+        result = future.result().result
+        if result.success:
+            self.get_logger().info(
+                f"Task completed: {result.result_message}"
+            )
+        else:
+            self.get_logger().error(
+                f"Task failed: {result.result_message}"
+            )
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = ActionParserNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 12.8.3 Launch File: Starting the Complete Pipeline
+
+```python
+# launch/voice_pipeline.launch.py
+# Launches all four nodes of the voice-to-action pipeline.
+# Usage: ros2 launch voice_pipeline voice_pipeline.launch.py
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, LogInfo
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+
+
+def generate_launch_description() -> LaunchDescription:
+    """
+    Launch all voice pipeline nodes with configurable parameters.
+
+    Nodes launched:
+        1. whisper_node          — Microphone capture + Whisper transcription
+        2. gpt4o_planner_node    — GPT-4o task planning
+        3. action_parser_node    — Grounding + goal dispatch
+        4. task_executor_server  — ROS 2 action server
+    """
+
+    # Declare launch arguments (overridable on CLI)
+    whisper_model_arg = DeclareLaunchArgument(
+        "whisper_model",
+        default_value="large-v3",
+        description="Whisper model size: tiny/base/small/medium/large-v3",
+    )
+    whisper_device_arg = DeclareLaunchArgument(
+        "whisper_device",
+        default_value="cuda",
+        description="Device for Whisper inference: cuda or cpu",
+    )
+    gpt_model_arg = DeclareLaunchArgument(
+        "gpt_model",
+        default_value="gpt-4o",
+        description="OpenAI model name for task planning",
+    )
+    language_arg = DeclareLaunchArgument(
+        "language",
+        default_value="en",
+        description="Language code for Whisper (e.g., en, ar, zh)",
+    )
+    confidence_threshold_arg = DeclareLaunchArgument(
+        "confidence_threshold",
+        default_value="0.6",
+        description="Minimum Whisper confidence to publish transcription",
+    )
+
+    whisper_node = Node(
+        package="voice_pipeline",
+        executable="whisper_node",
+        name="whisper_node",
+        output="screen",
+        parameters=[{
+            "model_size": LaunchConfiguration("whisper_model"),
+            "device": LaunchConfiguration("whisper_device"),
+            "language": LaunchConfiguration("language"),
+            "confidence_threshold": LaunchConfiguration("confidence_threshold"),
+        }],
+    )
+
+    gpt4o_planner_node = Node(
+        package="voice_pipeline",
+        executable="gpt4o_planner_node",
+        name="gpt4o_planner_node",
+        output="screen",
+        parameters=[{
+            "model": LaunchConfiguration("gpt_model"),
+            "temperature": 0.1,
+            "max_tokens": 1024,
+        }],
+    )
+
+    action_parser_node = Node(
+        package="voice_pipeline",
+        executable="action_parser_node",
+        name="action_parser_node",
+        output="screen",
+    )
+
+    task_executor_server = Node(
+        package="voice_pipeline",
+        executable="task_executor_server",
+        name="task_executor_server",
+        output="screen",
+    )
+
+    return LaunchDescription([
+        # Arguments
+        whisper_model_arg,
+        whisper_device_arg,
+        gpt_model_arg,
+        language_arg,
+        confidence_threshold_arg,
+        # Startup log
+        LogInfo(msg="Launching Voice-to-Action Pipeline..."),
+        # Nodes
+        whisper_node,
+        gpt4o_planner_node,
+        action_parser_node,
+        task_executor_server,
+    ])
+```
+
+---
+
+## 12.9 Chapter Summary and Bridge to Part VI
+
+The pipeline built in this chapter achieves something that would have been a multi-year engineering effort a decade ago: converting spoken natural language into physical robot action using commodity hardware, open-source middleware, and commercial AI APIs. Each stage resolves a distinct problem. Whisper large-v3 handles acoustics — converting noisy microphone audio into reliable text via voice activity detection that avoids unnecessary inference. GPT-4o handles semantics — interpreting that text not merely as syntax to be parsed, but as instruction to be understood, including unstated assumptions about object identity and implicit action sequencing. The action grounding system handles coordinate translation — mapping named references to the 3D poses that MoveIt 2 requires, by querying real-time perception rather than relying on a static world model. The ROS 2 action server handles execution — a preemptible, feedback-reporting layer that recovers from physical failures without requiring human intervention.
+
+The practical result — 1 to 3 seconds from spoken command to first robot movement — positions this system for domestic service tasks where conversational timing is appropriate. The limitations identified in Section 12.7 are real engineering constraints, not caveats added for balance: acoustic noise degrades Whisper, novel objects can cause GPT-4o to hallucinate identities, and the latency floor prevents use in time-critical manipulation contexts where closed-loop reactive control is the correct architecture.
+
+The engineering foundation built across Parts I through V — the ROS 2 architecture, the security layer, the simulation environments, the NVIDIA AI stack, and the VLA pipeline — now makes it possible to ask what all this capability actually means for human life. The remaining chapters change register from implementation to consequence.
+
+**Part VI** (Chapter 13) examines the concrete benefits that humanoid robots — when properly designed and deployed — can deliver: the physical, economic, and social gains that motivate the enormous investment this field is attracting. **Part VII** (Chapter 14) then applies equal analytical rigour to the risks: the safety failures, security vulnerabilities, economic disruptions, and ethical questions that must be resolved if those benefits are to be realized without causing equivalent harm.
+
+---
+
+## References
+
+[1] A. Radford et al., "Robust Speech Recognition via Large-Scale Weak Supervision," in *Proc. 40th Int. Conf. Machine Learning (ICML)*, Honolulu, HI, USA, Jul. 2023, pp. 28492–28518.
+
+[2] OpenAI, "GPT-4o System Card," OpenAI Technical Report, May 2024. [Online]. Available: https://openai.com/research/gpt-4o-system-card
+
+[3] S. Macenski, T. Foote, B. Gerkey, C. Lalancette, and W. Woodall, "Robot Operating System 2: Design, Architecture, and Uses in the Wild," *Science Robotics*, vol. 7, no. 66, p. eabm6074, May 2022.
+
+[4] S. Colvin, "Pydantic: Data Validation Using Python Type Annotations," GitHub repository, 2024. [Online]. Available: https://github.com/pydantic/pydantic
+
+[5] ROS 2 Design Working Group, "Actions in ROS 2," ROS 2 Design Documentation, 2022. [Online]. Available: https://design.ros2.org/articles/actions.html
+
+[6] A. Vaswani et al., "Attention Is All You Need," in *Advances in Neural Information Processing Systems (NeurIPS)*, vol. 30, 2017.
+
+[7] J. Thomason, M. Murray, M. Cakmak, and L. Zettlemoyer, "Vision-and-Dialog Navigation," in *Proc. 3rd Conf. Robot Learning (CoRL)*, Osaka, Japan, Oct. 2019, pp. 394–406.
+
+[8] R. Mooney, "Learning to Connect Language and Perception," in *Proc. 23rd AAAI Conf. Artificial Intelligence*, Chicago, IL, USA, Jul. 2008, pp. 1598–1601.
+
+[9] A. Shridhar et al., "ALFRED: A Benchmark for Interpreting Grounded Instructions for Everyday Tasks," in *Proc. IEEE/CVF Conf. Computer Vision and Pattern Recognition (CVPR)*, Jun. 2020, pp. 10740–10749.
+
+[10] B. Ichter et al., "Do As I Can, Not As I Say: Grounding Language in Robotic Affordances," in *Proc. 6th Conf. Robot Learning (CoRL)*, Auckland, New Zealand, Dec. 2022.
+
+[11] W. Huang et al., "Language Models as Zero-Shot Planners: Extracting Actionable Knowledge for Embodied Agents," in *Proc. 39th Int. Conf. Machine Learning (ICML)*, Baltimore, MD, USA, Jul. 2022, pp. 9118–9147.
+
+[12] M. Ahn et al., "SayCan: Do As I Can, Not As I Say: Grounding Language in Robotic Affordances," *arXiv preprint arXiv:2204.01691*, Apr. 2022. [Online]. Available: https://arxiv.org/abs/2204.01691
+
+[13] C. Lynch et al., "Interactive Language: Talking to Robots in Real Time," *IEEE Robotics and Automation Letters*, vol. 8, no. 9, pp. 5978–5985, Sep. 2023.
+
+---

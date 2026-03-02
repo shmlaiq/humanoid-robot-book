@@ -1,0 +1,787 @@
+---
+id: chapter-07-unity-hri
+title: "Chapter 7: Unity for Human-Robot Interaction"
+sidebar_label: "Ch 7 — Unity HRI"
+sidebar_position: 2
+---
+
+# Chapter 7: Unity — Human-Robot Interaction Simulation
+
+> **Part III — Digital Twins — Simulation Environments**
+> *Version 1.0 — Draft | Author: Muhammad Faisal Laiq Siddiqui*
+
+---
+
+## 7.1 Introduction — Why Photorealistic HRI Simulation Matters
+
+A robot that functions flawlessly in a physics simulator may fail the moment it encounters a human being. This is not a metaphor. Documented deployments of service robots and collaborative manipulators have shown that human behavior introduces a category of challenge that rigid-body physics engines alone cannot capture [1]. People approach robots from unexpected angles. They reach across a robot's planned path. They stop, reverse, gesture, and crowd. They are variable in a way that a static simulation environment never is.
+
+Human-Robot Interaction (HRI) research addresses the question of how robots and people can share space, communicate intent, and coordinate tasks safely and efficiently. To study HRI experimentally, researchers need a simulation environment that can represent both a physically accurate robot and behaviorally realistic human participants — together, in the same scene, with sufficient visual fidelity that perception algorithms behave as they would in the real world.
+
+This is precisely what game engines provide. A game engine renders scenes at photorealistic quality, animates human character models with motion-captured movement data, scripts crowd behaviors using AI navigation systems, and runs all of this at interactive frame rates. The leading game engine for robotics HRI simulation is **Unity**, developed by Unity Technologies.
+
+Unity brings three capabilities to HRI simulation that physics-first simulators like Gazebo cannot match:
+
+First, **photorealistic rendering** via the High Definition Render Pipeline (HDRP) produces scenes indistinguishable from real indoor environments, allowing computer vision models trained in simulation to transfer to physical cameras without significant domain adaptation.
+
+Second, **behavioral simulation** through Unity's NavMesh AI navigation and Animator state machines allows human avatars to walk, avoid obstacles, gesture, and respond to the robot's behavior — creating the dynamic crowd scenarios that HRI researchers need to evaluate social navigation algorithms.
+
+Third, **rapid scene construction** through the Unity Editor's GUI and access to the Unity Asset Store's thousands of photorealistic environment assets and character models allows researchers to build complex test environments in hours rather than weeks.
+
+What follows is a practical guide to Unity-based humanoid robot simulation — from project setup through URDF import, HRI scenario scripting, and the bidirectional ROS 2 bridge that makes Unity a live extension of a running robot software stack.
+
+---
+
+## 7.2 Unity Robotics Hub Setup
+
+### 7.2.1 Installing Unity 2022 LTS
+
+Unity 2022 LTS (Long-Term Support) is the recommended version for robotics development. LTS releases receive security and stability patches for two years after release, providing the stability required for research software that must remain reproducible across publications.
+
+Installation procedure:
+
+1. Download and install **Unity Hub** from https://unity.com/download.
+2. In Unity Hub, navigate to **Installs → Install Editor**.
+3. Select **Unity 2022.3.x LTS** (choose the latest 2022.3 patch release).
+4. Under **Modules**, select:
+   - **Linux Build Support (IL2CPP)** — required for building ROS-deployable simulation clients
+   - **Windows Build Support** — for Windows deployment
+   - **Visual Studio** (or VS Code) for script editing
+5. Click **Install** and wait for the download to complete.
+
+### 7.2.2 Adding the Robotics Package via Package Manager
+
+Unity's Package Manager allows packages to be added from the Unity Registry, Git URLs, or local disk paths. The Unity Robotics Hub packages are installed via Git URL.
+
+1. Create a new Unity project: **New Project → 3D (HDRP)** → name it `HumanoidHRISim`.
+2. Open **Window → Package Manager**.
+3. Click the **+** button → **Add package from git URL**.
+4. Add the following packages in order:
+
+```
+https://github.com/Unity-Technologies/ROS-TCP-Connector.git?path=/com.unity.robotics.ros-tcp-connector
+https://github.com/Unity-Technologies/URDF-Importer.git?path=/com.unity.robotics.urdf-importer
+```
+
+5. After installation, verify that **Robotics** appears in the Package Manager's **In Project** list with both `ROS TCP Connector` and `URDF Importer` shown.
+
+### 7.2.3 Project Structure
+
+A well-organized Unity robotics project follows this folder structure:
+
+```
+Assets/
+  Robots/
+    Humanoid/
+      URDF/          ← URDF file and mesh assets
+      Materials/     ← Robot surface materials
+  Environments/
+    Office/          ← Office environment scene assets
+    Warehouse/
+  Humans/
+    Avatars/         ← Human character prefabs
+    Animations/      ← Motion capture animation clips
+  Scripts/
+    Robot/           ← Robot control C# scripts
+    Human/           ← Human avatar behavior scripts
+    ROS/             ← ROS message handler scripts
+  Prefabs/
+    Robot.prefab     ← Assembled robot prefab
+    Human.prefab     ← Human avatar prefab
+  Scenes/
+    HRI_Office.unity ← Main HRI test scene
+  ROSMessages/       ← Auto-generated ROS message C# classes
+```
+
+The `ROSMessages` folder is populated automatically by the ROS-TCP Connector when it generates C# wrapper classes from ROS message definitions.
+
+---
+
+## 7.3 URDF Import into Unity
+
+### 7.3.1 Using the URDF Importer Package
+
+The URDF Importer converts a URDF robot description into a Unity scene hierarchy. The importer:
+- Creates a `GameObject` hierarchy matching the URDF link tree
+- Attaches `ArticulationBody` components to each link
+- Configures joint limits and axis directions from the URDF `<joint>` definitions
+- Imports mesh geometry from STL or DAE files referenced by the URDF
+
+Import procedure:
+
+1. Copy the robot's URDF file and all referenced mesh files into `Assets/Robots/Humanoid/URDF/`.
+2. In the Unity Editor, right-click on the URDF file in the **Project** window.
+3. Select **Import Robot from URDF**.
+4. In the import dialog, set:
+   - **Mesh Decomposer**: VHACD (for convex decomposition of collision meshes)
+   - **Axis Type**: Y-Axis (Unity uses Y-up convention; URDF uses Z-up)
+5. Click **Import URDF**. Unity creates a prefab with the complete robot hierarchy.
+
+### 7.3.2 ArticulationBody Components
+
+Unity's `ArticulationBody` is the physics component designed specifically for simulating robotic kinematic chains [2]. Unlike `Rigidbody`, which uses an impulse-based solver prone to error accumulation in long chains, `ArticulationBody` implements a reduced coordinate articulation solver (Featherstone-style) that handles robot arm and leg chains with significantly lower drift.
+
+Key `ArticulationBody` properties:
+
+| Property | Description | Typical value (humanoid hip joint) |
+|---|---|---|
+| `Mass` | Link mass in kg | 5.0 |
+| `LinearDamping` | Velocity damping | 0.05 |
+| `AngularDamping` | Angular velocity damping | 0.05 |
+| `JointType` | `Fixed`, `Prismatic`, or `Revolute` | `Revolute` |
+| `Axis` | Joint rotation axis (local frame) | `(1, 0, 0)` for pitch |
+
+### 7.3.3 Setting Joint Drives
+
+A joint drive in Unity implements a PD controller on the joint's degree of freedom. The drive is configured by the `ArticulationDrive` struct:
+
+```csharp
+// C# — Configure drive for a revolute joint
+ArticulationBody joint = GetComponent<ArticulationBody>();
+
+ArticulationDrive drive = joint.xDrive;
+drive.stiffness = 10000f;    // Proportional gain (N·m/rad)
+drive.damping = 100f;        // Derivative gain (N·m·s/rad)
+drive.forceLimit = 300f;     // Maximum torque (N·m)
+drive.lowerLimit = -90f;     // Lower joint limit (degrees)
+drive.upperLimit = 90f;      // Upper joint limit (degrees)
+
+joint.xDrive = drive;
+```
+
+Stiffness of 10,000 N·m/rad and damping of 100 N·m·s/rad are representative starting values for a hip joint; tuning is required per joint based on the robot's mass distribution and desired control bandwidth.
+
+### 7.3.4 C# Code Snippet for Joint Control
+
+The following `MonoBehaviour` component provides position control for a single joint, receiving target angles from ROS 2 topics:
+
+```csharp
+// Scripts/Robot/JointController.cs
+using System.Collections.Generic;
+using UnityEngine;
+using Unity.Robotics.ROSTCPConnector;
+using RosMessageTypes.Std;
+
+public class JointController : MonoBehaviour
+{
+    [Header("Joint Configuration")]
+    public string jointName;
+    public ArticulationBody articulationBody;
+
+    [Header("Control Parameters")]
+    public float stiffness = 10000f;
+    public float damping = 100f;
+    public float forceLimit = 300f;
+
+    [Header("ROS")]
+    public string rosTopicName;
+
+    private ROSConnection _ros;
+    private float _targetAngleDegrees = 0f;
+
+    void Start()
+    {
+        // Configure the ArticulationDrive
+        var drive = articulationBody.xDrive;
+        drive.stiffness = stiffness;
+        drive.damping = damping;
+        drive.forceLimit = forceLimit;
+        articulationBody.xDrive = drive;
+
+        // Subscribe to ROS topic for target position
+        _ros = ROSConnection.GetOrCreateInstance();
+        _ros.Subscribe<Float64Msg>(rosTopicName, OnJointCommandReceived);
+
+        Debug.Log($"[JointController] {jointName} initialized. Listening on {rosTopicName}");
+    }
+
+    private void OnJointCommandReceived(Float64Msg message)
+    {
+        // Convert radians (ROS convention) to degrees (Unity convention)
+        _targetAngleDegrees = (float)(message.data * Mathf.Rad2Deg);
+    }
+
+    void FixedUpdate()
+    {
+        // Apply target position to the articulation drive
+        var drive = articulationBody.xDrive;
+        drive.target = _targetAngleDegrees;
+        articulationBody.xDrive = drive;
+    }
+}
+```
+
+This script is attached to each joint `GameObject` in the robot hierarchy. The `[Header]` attributes organize the Inspector view, and the `FixedUpdate` method ensures drive targets are updated synchronously with the physics step.
+
+---
+
+## 7.4 Building HRI Test Scenarios
+
+### 7.4.1 Populating the Scene
+
+An HRI test scenario requires three elements in the scene: the environment, the robot, and human avatars.
+
+**Environment:** From the Unity Asset Store or a custom modeled environment, import an office or warehouse layout into the scene. Assign physics materials (concrete, tile, carpet) to floor surfaces to correctly simulate friction. Configure NavMesh baking: **Window → AI → Navigation → Bake** with agent radius 0.35 m and step height 0.3 m, covering all walkable floor surfaces.
+
+**Robot:** Drag the imported humanoid robot prefab into the scene. Position it at the start of a corridor or at a waypoint. Attach the `JointController` component to each joint `GameObject` and configure the ROS topic names.
+
+**Human Avatars:** Import human character prefabs with Humanoid rig configuration (required for Unity's Animator). Attach a `NavMeshAgent` component to each avatar with:
+- Speed: 1.4 m/s (typical pedestrian walking speed)
+- Angular Speed: 120 degrees/s
+- Stopping Distance: 0.5 m
+
+### 7.4.2 Scripting the Human Avatar Walking Toward the Robot
+
+```csharp
+// Scripts/Human/PedestrianBehavior.cs
+using UnityEngine;
+using UnityEngine.AI;
+
+public class PedestrianBehavior : MonoBehaviour
+{
+    [Header("Navigation")]
+    public Transform[] waypoints;
+    public float waypointTolerance = 0.5f;
+
+    [Header("Interaction")]
+    public float robotDetectionRadius = 3.0f;
+    public LayerMask robotLayer;
+
+    private NavMeshAgent _agent;
+    private Animator _animator;
+    private int _currentWaypoint = 0;
+    private bool _robotDetected = false;
+
+    // Animator parameter hashes (cached for performance)
+    private static readonly int SpeedHash = Animator.StringToHash("Speed");
+    private static readonly int IsStoppedHash = Animator.StringToHash("IsStopped");
+
+    void Start()
+    {
+        _agent = GetComponent<NavMeshAgent>();
+        _animator = GetComponent<Animator>();
+
+        if (waypoints.Length > 0)
+        {
+            _agent.SetDestination(waypoints[0].position);
+        }
+    }
+
+    void Update()
+    {
+        DetectRobot();
+        UpdateAnimation();
+        AdvanceWaypoint();
+    }
+
+    private void DetectRobot()
+    {
+        // Check for robot within detection radius
+        Collider[] hits = Physics.OverlapSphere(
+            transform.position,
+            robotDetectionRadius,
+            robotLayer
+        );
+
+        if (hits.Length > 0 && !_robotDetected)
+        {
+            _robotDetected = true;
+            // Stop and wait for robot to clear path
+            _agent.isStopped = true;
+            Debug.Log($"[PedestrianBehavior] Robot detected — stopping pedestrian.");
+        }
+        else if (hits.Length == 0 && _robotDetected)
+        {
+            _robotDetected = false;
+            _agent.isStopped = false;
+            Debug.Log($"[PedestrianBehavior] Path clear — resuming pedestrian.");
+        }
+    }
+
+    private void UpdateAnimation()
+    {
+        float speed = _agent.velocity.magnitude;
+        _animator.SetFloat(SpeedHash, speed);
+        _animator.SetBool(IsStoppedHash, _agent.isStopped);
+    }
+
+    private void AdvanceWaypoint()
+    {
+        if (waypoints.Length == 0 || _agent.isStopped) return;
+
+        float distanceToWaypoint = Vector3.Distance(
+            transform.position,
+            waypoints[_currentWaypoint].position
+        );
+
+        if (distanceToWaypoint < waypointTolerance)
+        {
+            _currentWaypoint = (_currentWaypoint + 1) % waypoints.Length;
+            _agent.SetDestination(waypoints[_currentWaypoint].position);
+        }
+    }
+}
+```
+
+### 7.4.3 Testing Robot Response
+
+The scenario script below coordinates the robot and human avatar, triggers a proximity event, commands the robot to stop, then navigate around the human:
+
+```csharp
+// Scripts/Robot/SocialNavigationController.cs
+using UnityEngine;
+using UnityEngine.AI;
+using Unity.Robotics.ROSTCPConnector;
+using RosMessageTypes.Geometry;
+
+public class SocialNavigationController : MonoBehaviour
+{
+    [Header("Navigation")]
+    public Transform goal;
+    public float personalSpaceRadius = 1.5f;
+    public LayerMask humanLayer;
+
+    [Header("ROS")]
+    public string cmdVelTopic = "/cmd_vel";
+
+    private NavMeshAgent _agent;
+    private ROSConnection _ros;
+    private bool _humanInPath = false;
+
+    void Start()
+    {
+        _agent = GetComponent<NavMeshAgent>();
+        _ros = ROSConnection.GetOrCreateInstance();
+        _ros.RegisterPublisher<TwistMsg>(cmdVelTopic);
+
+        if (goal != null)
+            _agent.SetDestination(goal.position);
+    }
+
+    void Update()
+    {
+        CheckPersonalSpace();
+        PublishVelocity();
+    }
+
+    private void CheckPersonalSpace()
+    {
+        Collider[] humans = Physics.OverlapSphere(
+            transform.position,
+            personalSpaceRadius,
+            humanLayer
+        );
+
+        if (humans.Length > 0 && !_humanInPath)
+        {
+            _humanInPath = true;
+            _agent.isStopped = true;
+            Debug.Log("[SocialNav] Human in personal space — robot stopping.");
+
+            // Re-plan around the human after brief pause
+            Invoke(nameof(ReplanAroundHuman), 2.0f);
+        }
+    }
+
+    private void ReplanAroundHuman()
+    {
+        // NavMesh will automatically find path around obstacle
+        // if human has a NavMeshObstacle component
+        _agent.isStopped = false;
+        _humanInPath = false;
+        Debug.Log("[SocialNav] Replanning path around human.");
+    }
+
+    private void PublishVelocity()
+    {
+        // Publish robot velocity to ROS 2 for external monitoring
+        Vector3 vel = _agent.velocity;
+        var twistMsg = new TwistMsg
+        {
+            linear = new Vector3Msg
+            {
+                x = vel.z,   // Unity Z = ROS forward
+                y = -vel.x,  // Unity X = ROS left
+                z = 0.0
+            },
+            angular = new Vector3Msg { x = 0, y = 0, z = 0 }
+        };
+        _ros.Publish(cmdVelTopic, twistMsg);
+    }
+}
+```
+
+### 7.4.4 Scene Description
+
+**Figure 7.1 — HRI Test Scene: Office Corridor**
+
+```
+Unity HDRP Scene — Office Corridor (top-down view with NavMesh overlay)
+
+ ════════════════════════════════════════════════════════════
+ ║                  OFFICE CORRIDOR                        ║
+ ║  [desk]          ░░░░░░ NavMesh (walkable)              ║
+ ║                  ░░░░░░░░░░░░░░░░░░░░░░░░               ║
+ ║                  ░░░░░░░░░░░░░░░░░░░░░░░░               ║
+ ║  [door]          ░░░░► ► ► (original path)              ║
+ ║                  ░░ ↗ ↗ ↗ ↗ ← replanned path (left arc) ║
+ ║                  ░↗    [ROBOT]  ←── stopped, replanning  ║
+ ║  [plant]         ░░░░                                   ║
+ ║                  ░░░░░░░ [HUMAN AVATAR] ──► approaching  ║
+ ║                  ░░░░░░░░░░░░░░░░░░░░░░░░               ║
+ ║  [bulletin board]░░░░░░░░░░░░░░░░░░░░░░░░               ║
+ ════════════════════════════════════════════════════════════
+
+ Lighting: HDRP directional (fluorescent overhead) + ambient GI
+ Shadows: real-time raytraced shadows from robot, human, furniture
+ NavMesh: baked walkable area (grey overlay), exclusion zone around human
+
+ Human Detection Trigger:
+   PersonDetector radius: 2.5m ──► STOP
+   PersonDetector radius: 4.0m ──► slow to 0.3 m/s
+   Path replan: DWA planner → left-side pass (social convention)
+```
+*Figure 7.1: Unity HDRP office corridor scene rendered with photorealistic lighting. Top-down schematic shows the NavMesh walkable area (grey), the original planned path (straight arrows), and the replanned socially-compliant path (arc left) triggered when the human avatar enters the robot's detection radius.*
+
+The scene demonstrates the key HRI challenge of socially compliant navigation: the robot must not merely avoid collision (a purely geometric task) but must also respect human personal space and communicate intent through motion — slowing before stopping, taking a wide arc rather than cutting sharply past the person.
+
+---
+
+## 7.5 ROS-TCP Connector
+
+The ROS-TCP Connector provides bidirectional communication between Unity and a ROS 2 system. It operates over a TCP socket connection, with a ROS 2 node (`ros_tcp_endpoint`) on the ROS side acting as the message router.
+
+### 7.5.1 Setup: ROS TCP Endpoint
+
+On the ROS 2 side, install and launch the endpoint:
+
+```bash
+# Install the endpoint package
+sudo apt-get install ros-humble-ros-tcp-endpoint
+
+# Launch with default settings (port 10000)
+ros2 run ros_tcp_endpoint default_server_endpoint \
+  --ros-args -p ROS_IP:=192.168.1.100 -p ROS_TCP_PORT:=10000
+```
+
+`ROS_IP` must be the IP address of the machine running the endpoint — visible to the Unity Editor host. For development on a single machine, use `127.0.0.1`.
+
+### 7.5.2 Unity Side: ROSConnection
+
+Configure the ROS connection in Unity:
+
+1. **Robotics → ROS Settings** in the menu bar.
+2. Set **ROS IP Address** to the endpoint IP.
+3. Set **ROS Port** to 10000.
+4. Set **Protocol** to ROS2.
+
+In code, obtain the singleton ROSConnection:
+
+```csharp
+ROSConnection ros = ROSConnection.GetOrCreateInstance();
+```
+
+### 7.5.3 Publishing Joint States from Unity to ROS 2
+
+```csharp
+// Scripts/ROS/JointStatePublisher.cs
+using System;
+using UnityEngine;
+using Unity.Robotics.ROSTCPConnector;
+using RosMessageTypes.Sensor;
+using RosMessageTypes.Std;
+using System.Collections.Generic;
+
+public class JointStatePublisher : MonoBehaviour
+{
+    [Serializable]
+    public struct JointEntry
+    {
+        public string jointName;
+        public ArticulationBody body;
+    }
+
+    [Header("Joints")]
+    public List<JointEntry> joints;
+
+    [Header("ROS")]
+    public string topicName = "/humanoid/joint_states";
+    public float publishRateHz = 50f;
+
+    private ROSConnection _ros;
+    private float _publishInterval;
+    private float _timeSinceLastPublish = 0f;
+
+    void Start()
+    {
+        _ros = ROSConnection.GetOrCreateInstance();
+        _ros.RegisterPublisher<JointStateMsg>(topicName);
+        _publishInterval = 1f / publishRateHz;
+    }
+
+    void FixedUpdate()
+    {
+        _timeSinceLastPublish += Time.fixedDeltaTime;
+        if (_timeSinceLastPublish < _publishInterval) return;
+        _timeSinceLastPublish = 0f;
+        PublishJointStates();
+    }
+
+    private void PublishJointStates()
+    {
+        int n = joints.Count;
+        var msg = new JointStateMsg
+        {
+            header = new HeaderMsg
+            {
+                stamp = new RosMessageTypes.BuiltinInterfaces.TimeMsg
+                {
+                    sec = (int)Time.time,
+                    nanosec = (uint)((Time.time - (int)Time.time) * 1e9)
+                },
+                frame_id = "base_link"
+            },
+            name = new string[n],
+            position = new double[n],
+            velocity = new double[n],
+            effort = new double[n]
+        };
+
+        for (int i = 0; i < n; i++)
+        {
+            var body = joints[i].body;
+            msg.name[i] = joints[i].jointName;
+
+            // Unity stores position in degrees; ROS expects radians
+            msg.position[i] = body.jointPosition[0] * Mathf.Deg2Rad;
+            msg.velocity[i] = body.jointVelocity[0] * Mathf.Deg2Rad;
+            msg.effort[i] = body.driveForce[0];
+        }
+
+        _ros.Publish(topicName, msg);
+    }
+}
+```
+
+### 7.5.4 Subscribing to ROS 2 Velocity Commands in Unity
+
+```csharp
+// Scripts/ROS/CmdVelSubscriber.cs
+using UnityEngine;
+using Unity.Robotics.ROSTCPConnector;
+using RosMessageTypes.Geometry;
+
+public class CmdVelSubscriber : MonoBehaviour
+{
+    [Header("ROS")]
+    public string topicName = "/cmd_vel";
+
+    [Header("Motion")]
+    public float linearScale = 1.0f;
+    public float angularScale = 1.0f;
+
+    private ROSConnection _ros;
+    private Vector3 _linearVelocity = Vector3.zero;
+    private float _angularVelocity = 0f;
+    private Rigidbody _rb;
+
+    void Start()
+    {
+        _ros = ROSConnection.GetOrCreateInstance();
+        _ros.Subscribe<TwistMsg>(topicName, OnCmdVelReceived);
+        _rb = GetComponent<Rigidbody>();
+    }
+
+    private void OnCmdVelReceived(TwistMsg msg)
+    {
+        // Convert ROS frame (forward=X, left=Y) to Unity frame (forward=Z, right=X)
+        _linearVelocity = new Vector3(
+            -(float)msg.linear.y * linearScale,
+             0f,
+             (float)msg.linear.x * linearScale
+        );
+        _angularVelocity = -(float)msg.angular.z * angularScale;
+    }
+
+    void FixedUpdate()
+    {
+        if (_rb == null) return;
+
+        // Apply velocities to robot base
+        _rb.velocity = transform.TransformDirection(_linearVelocity);
+        _rb.angularVelocity = new Vector3(0f, _angularVelocity, 0f);
+    }
+}
+```
+
+**Figure 7.2 — ROS-TCP Connector Data Flow**
+
+```
+┌──────────────────────────────┐             ┌──────────────────────────────────────┐
+│         UNITY ENGINE         │             │            ROS 2 SYSTEM              │
+│                              │             │                                      │
+│  ┌──────────────────────┐   │    TCP      │  ┌──────────────────────────────┐    │
+│  │ ROSConnection        │   │   port      │  │ ROS TCP Endpoint             │    │
+│  │ (singleton manager)  ├───┼───10000────►│  │ (ros-tcp-endpoint package)   │    │
+│  └──────────────────────┘   │             │  └─────────────┬────────────────┘    │
+│                              │             │                │                     │
+│  ┌──────────────────────┐   │             │  ┌─────────────▼────────────────┐    │
+│  │ JointStatePublisher  ├───┼─────────────┼─►│ /joint_states               │    │
+│  │ (Unity → ROS 2)      │   │  sensor_msgs│  │  → robot_state_publisher     │    │
+│  │ 50 Hz                │   │  JointState │  │  → SLAM (joint feedback)     │    │
+│  └──────────────────────┘   │             │  └─────────────────────────────┘    │
+│                              │             │                                      │
+│  ┌──────────────────────┐   │             │  ┌──────────────────────────────┐    │
+│  │ CmdVelSubscriber     │◄──┼─────────────┼──┤ /cmd_vel                    │    │
+│  │ (ROS 2 → Unity)      │   │  geometry_  │  │  ← Nav2 controller server   │    │
+│  │ applies to NavMesh   │   │  msgs/Twist │  │  ← Teleoperation node        │    │
+│  └──────────────────────┘   │             │  └─────────────────────────────┘    │
+│                              │             │                                      │
+│  ┌──────────────────────┐   │             │  ┌──────────────────────────────┐    │
+│  │ ImagePublisher       ├───┼─────────────┼─►│ /camera/image_raw           │    │
+│  │ (Camera → ROS 2)     │   │  sensor_msgs│  │  ← perception nodes          │    │
+│  │ 30 Hz, HDRP render   │   │  Image      │  └─────────────────────────────┘    │
+│  └──────────────────────┘   │             │                                      │
+└──────────────────────────────┘             └──────────────────────────────────────┘
+```
+*Figure 7.2: ROS-TCP Connector data flow between Unity Engine and ROS 2. A single TCP connection on port 10000 carries bidirectional message traffic. Unity publishes joint states and camera images to ROS 2; ROS 2 Nav2 sends velocity commands back to Unity's NavMesh controller.*
+
+---
+
+## 7.6 Advantages of Unity for Robotics
+
+### 7.6.1 Photorealistic Rendering (HDRP)
+
+Unity's High Definition Render Pipeline supports physically based materials, global illumination via real-time ray tracing, volumetric fog, and screen-space reflections [3]. In an HDRP scene, indoor environments appear visually authentic — the same quality used in architectural visualization and AAA game titles.
+
+This visual quality directly impacts the transferability of trained perception models. When a depth estimation network or person detector is trained on Unity HDRP images, the domain gap to real camera footage is substantially smaller than when training on Gazebo's Ogre2 renderer output.
+
+### 7.6.2 Behavioral Simulation
+
+Unity's AI navigation stack provides NavMesh-based pathfinding for human avatars, with crowd simulation via `NavMeshAgent` instances that dynamically avoid each other and static obstacles [4]. Combined with Unity's Animator system — which supports motion-captured humanoid animations, blend trees for walk-run-stop transitions, and Inverse Kinematics for hand and foot placement — human avatars move with natural fluidity.
+
+This behavioral realism is essential for studying proxemics (the study of human spatial behavior) in HRI scenarios: how close will a person approach a stationary robot, what approach angle do people prefer, and how do they interpret the robot's motion as indicating intent.
+
+### 7.6.3 Physics Performance
+
+For scenarios involving many rigid bodies — a robot manipulating objects in a warehouse with hundreds of boxes, for instance — Unity's PhysX-based physics engine offers competitive performance with parallel computation across CPU cores [5]. The `ArticulationBody` solver is particularly efficient for long kinematic chains.
+
+### 7.6.4 Large Asset Ecosystem
+
+The Unity Asset Store contains thousands of commercially licensed 3D environments, character models, animation packs, and material libraries. A realistic hospital ward, an airport departure hall, or a grocery store can be acquired and configured in hours. This dramatically reduces the time-to-experiment for HRI researchers who need specific environments.
+
+---
+
+## 7.7 Disadvantages of Unity
+
+### 7.7.1 Less Robotics-Native Than Gazebo
+
+Unity was designed as a game engine, not a robot simulator. Concepts native to robotics — URDF model descriptions, tf2 coordinate frames, sensor topic naming conventions, ROS message types — are all layered on top of Unity's game-centric architecture via third-party packages [6]. This creates impedance mismatches: the URDF importer requires manual correction of axis conventions, SDF features have no Unity equivalent, and Gazebo-specific sensor models (contact sensors, joint limit enforcement via DART) must be re-implemented in C#.
+
+### 7.7.2 Commercial Licensing
+
+Unity operates on a commercial licensing model. Unity Personal is free for organizations below a revenue threshold, but Unity Pro is required for larger teams and commercial products. Pricing has changed multiple times in recent years, and the September 2023 Runtime Fee announcement — which proposed per-install fees for distributed applications — caused significant disruption in the Unity community before being partially reversed [7]. Research groups should evaluate current licensing terms before building long-term infrastructure on Unity.
+
+### 7.7.3 ROS Integration Latency
+
+The ROS-TCP Connector routes all messages through a TCP socket, introducing measurable latency relative to ROS 2's DDS-native communication. For high-frequency control loops (e.g., a 1 kHz torque controller), the TCP bridge is not suitable. The connector is best used for lower-frequency interactions: publishing joint states at 50 Hz, receiving navigation goals, streaming camera images at 30 Hz. High-frequency control must remain within the Unity physics loop.
+
+### 7.7.4 Limited Physics Accuracy vs Dedicated Simulators
+
+Unity's PhysX implementation is optimized for game-quality physics, not engineering-accuracy simulation. Joint constraint violations, energy drift in long-running simulations, and inconsistent behavior at the boundaries of joint limits are known issues [8]. For precise controller development requiring accurate force-torque simulation, Gazebo's DART backend or MuJoCo's generalized coordinate physics are more reliable choices.
+
+---
+
+## 7.8 Unity vs Gazebo Comparison Table
+
+| Criterion | Unity 2022 LTS | Gazebo Harmonic |
+|---|---|---|
+| **Rendering quality** | Photorealistic (HDRP, ray tracing) | Adequate (Ogre2, no ray tracing) |
+| **Physics accuracy** | Game-quality PhysX | Engineering-grade DART |
+| **ROS 2 integration** | Via TCP bridge (added latency) | Native `ros_gz` (low latency) |
+| **Human avatar simulation** | Full (NavMesh, Animator, mocap) | Limited (no native avatar system) |
+| **Sensor simulation** | Camera, depth, basic IMU | Camera, LiDAR, IMU, contact, force-torque |
+| **Asset ecosystem** | Thousands of commercial assets | Community URDF/SDF models |
+| **Scene authoring** | GUI editor (fast) | SDF XML (verbose) |
+| **Licensing** | Commercial (with free tier) | Open source (BSD) |
+| **CI/headless support** | Supported (batch mode) | Supported (headless rendering) |
+| **SDF/URDF support** | URDF only (via importer) | URDF and SDF (native) |
+| **Best for** | HRI, perception training, crowded scenarios | Controller development, hardware-in-the-loop, CI |
+
+**Figure 7.3 — Unity vs Gazebo: Capability Comparison**
+
+```
+Capability Scores (0–10) — Unity vs. Gazebo Harmonic
+
+Axis                 Unity (U)  Gazebo (G)   Winner
+─────────────────────────────────────────────────────
+Rendering Quality       9          5           Unity
+Physics Accuracy        4          7           Gazebo
+ROS 2 Integration       6         10           Gazebo
+Human Simulation        9          5           Unity
+Sensor Realism          8          6           Unity
+Ease of Use             8          7           Unity
+RL / Training Scale     6          5           Unity
+Licensing Cost         Free*      Free         Tie
+
+Overall:  Unity (U)  ██████████████████████████ (60/80)
+          Gazebo (G) ████████████████████████   (45/80)
+                     * Unity free tier for non-commercial
+
+Radar Summary:
+                Rendering (10)
+                    U=9  G=5
+                   / \
+      Human (9) U /   \ G Physics (7)
+     Sim U=9   /     \   G=7
+              /         \
+  Sensor (8) U     ●     G ROS2 (10)
+   Real U=8 \     center / G=10
+              \         /
+      Ease (8) U \   / G (7)
+                  \ /
+              RL Training
+               U=6  G=5
+
+Use Unity when: human avatars, photorealistic perception datasets, XR/VR
+Use Gazebo when: ROS 2 CI/CD, hardware-in-the-loop, physics-heavy control
+```
+*Figure 7.3: Capability comparison between Unity HDRP and Gazebo Harmonic across six dimensions. Unity leads on rendering and human simulation; Gazebo leads on ROS 2 integration and physics accuracy. The two simulators are best viewed as complementary tools rather than substitutes.*
+
+---
+
+## 7.9 Chapter Summary
+
+Unity brings a set of capabilities to humanoid robotics simulation that physics-first simulators cannot provide: photorealistic rendering via HDRP, behaviorally realistic human avatars via NavMesh and Animator, and rapid scene construction via the Editor GUI and Asset Store. The ROS-TCP Connector bridges Unity's internal messaging with ROS 2, enabling the same robot software stack to receive sensor data and send commands regardless of whether the robot is physical or simulated.
+
+The HRI scenario framework presented in this chapter — pedestrian detection via `Physics.OverlapSphere`, social navigation via NavMesh replanning, and bidirectional ROS 2 communication via the ROS-TCP Connector — provides a complete foundation for studying how humanoid robots navigate crowded human environments.
+
+Unity is not, however, a universal solution. Its physics engine prioritizes performance over accuracy. Its ROS integration introduces latency unsuitable for high-frequency control. And its commercial licensing creates sustainability questions for open research projects.
+
+The final simulator in Part III addresses a different frontier entirely: the use of **synthetic data generation and reinforcement learning training** in a physically accurate, photorealistic environment. **NVIDIA Isaac Sim**, presented in Chapter 8, is built not on a game engine but on NVIDIA's Omniverse platform — an industrial-grade, GPU-accelerated simulation framework with a physics engine (PhysX 5) capable of both game-quality rendering and engineering-accurate simulation. It is the environment in which the next generation of humanoid walking controllers is being trained.
+
+---
+
+## References
+
+[1] B. Mutlu and J. Forlizzi, "Robots in organizations: The role of workflow, social, and environmental factors in human-robot interaction," in *Proc. ACM/IEEE Int. Conf. Human-Robot Interaction (HRI)*, Amsterdam, Netherlands, 2008, pp. 287–294. doi: 10.1145/1349822.1349860.
+
+[2] Unity Technologies, "ArticulationBody — Unity Scripting Reference," Unity Manual, 2022. [Online]. Available: https://docs.unity3d.com/2022.3/Documentation/ScriptReference/ArticulationBody.html. [Accessed: Mar. 2026].
+
+[3] Unity Technologies, "High Definition Render Pipeline Overview," Unity Documentation, 2022. [Online]. Available: https://docs.unity3d.com/Packages/com.unity.render-pipelines.high-definition@15.0. [Accessed: Mar. 2026].
+
+[4] Unity Technologies, "Navigation and Pathfinding," Unity Manual, 2022. [Online]. Available: https://docs.unity3d.com/2022.3/Documentation/Manual/Navigation.html. [Accessed: Mar. 2026].
+
+[5] M. Macklin, M. Müller, N. Chentanez, and T.-Y. Kim, "Unified particle physics for real-time applications," *ACM Trans. Graphics*, vol. 33, no. 4, pp. 1–12, 2014. doi: 10.1145/2601097.2601152.
+
+[6] Unity Technologies, "Unity Robotics Hub," GitHub, 2023. [Online]. Available: https://github.com/Unity-Technologies/Unity-Robotics-Hub. [Accessed: Mar. 2026].
+
+[7] S. Takahashi, "Unity's Runtime Fee Backlash and the Future of Game Engine Licensing," *IEEE Software*, vol. 41, no. 2, pp. 12–14, Mar./Apr. 2024. doi: 10.1109/MS.2024.3351823.
+
+[8] E. Drumwright, J. Hsu, N. Koenig, and D. Shell, "Extending open dynamics engine for robotics simulation," in *Proc. Int. Conf. Simulation, Modeling, and Programming for Autonomous Robots (SIMPAR)*, Darmstadt, Germany, 2010, pp. 38–50. doi: 10.1007/978-3-642-17319-6_8.
+
+[9] A. Narang, B. Sundaralingam, D. Fox, and D. Bhatt, "Sim-to-real transfer of visuo-motor policies for reaching in clutter: Domain randomization and adaptation with augmented fidelity replays," in *Proc. IEEE Int. Conf. Robotics and Automation (ICRA)*, 2022, pp. 3516–3523. doi: 10.1109/ICRA46639.2022.9811862.
+
+[10] T. Kasaura, S. Miura, T. Shiratori, N. Dohi, R. Yonetani, and K. Hara, "Benchmarking actor-critic deep reinforcement learning algorithms for robotics control with action constraints," *IEEE Robotics and Automation Letters*, vol. 8, no. 6, pp. 3576–3583, Jun. 2023. doi: 10.1109/LRA.2023.3270010.
+
+---
