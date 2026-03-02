@@ -2,8 +2,7 @@
 id: intro
 title: About This Book
 sidebar_label: "📖 About This Book"
-sidebar_position: 0
-slug: /
+sidebar_position: 2
 ---
 
 # Pros and Cons of AI Humanoid Robots in Human Life
