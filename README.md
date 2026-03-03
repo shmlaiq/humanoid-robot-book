@@ -81,27 +81,6 @@ To save a PDF copy:
 
 ---
 
-## Run Locally
-
-```bash
-git clone https://github.com/shmlaiq/humanoid-robot-book.git
-cd humanoid-robot-book/website
-npm install
-npm start
-```
-
-Open [http://localhost:3000](http://localhost:3000) to read the local copy.
-
-To regenerate the print HTML:
-
-```bash
-cd humanoid-robot-book/
-node generate-print-html.js
-# Output: website/static/print-book.html
-```
-
----
-
 ## About the Author
 
 **Muhammad Faisal Laiq Siddiqui** is a technology professional, AI researcher, and technical author working at the intersection of robotics, artificial intelligence, and human society. With a background spanning cloud infrastructure, software engineering, and applied AI systems, he brings an engineer's rigour and a writer's clarity to the rapidly evolving field of embodied intelligence.
