@@ -1,7 +1,7 @@
 # Pros and Cons of AI Humanoid Robots in Human Life
 
 > **A Balanced Technical Analysis of Embodied Intelligence**
-> *By Muhammad Faisal Laiq Siddiqui — First Edition, 2025*
+> *By Muhammad Faisal Laiq Siddiqui — First Edition, 2026*
 
 [![Read Online](https://img.shields.io/badge/Read%20Online-Live%20Book-3b82f6?style=for-the-badge&logo=docusaurus)](https://humanoid-robot-book-gamma.vercel.app)
 [![Print / PDF](https://img.shields.io/badge/Print%20%2F%20PDF-Save%20as%20PDF-6366f1?style=for-the-badge&logo=googlechrome)](https://humanoid-robot-book-gamma.vercel.app/print-book.html)
