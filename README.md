@@ -117,4 +117,4 @@ His work centres on understanding complex AI systems not merely as technical art
 
 ---
 
-*© 2025 Muhammad Faisal Laiq Siddiqui. All rights reserved.*
+*© 2026 Muhammad Faisal Laiq Siddiqui. All rights reserved.*
